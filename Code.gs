@@ -1,10 +1,16 @@
 /**
  * @OnlyCurrentDoc
  * This script adds a custom menu to the spreadsheet for advanced scheduling.
+ * 
+ * 1.1.0
  */
 
 // Index (0-based) of the Settings sheet — third in the workbook.
 const SETTINGS_SHEET_INDEX = 2;
+
+// NEW: Number of previous meetings (columns) to review when prioritizing members.
+// A lower count means a member has been assigned less often recently and will be prioritised.
+const LOOKBACK_WEEKS = 3;
 
 // Global variables to hold settings.
 let MAIN_PROTECTED_ROLES = [];
@@ -143,23 +149,62 @@ function fillNextEmptyMeetingColumn() {
     }
   }
   
-  const prevAssignments = new Map();
-  if (targetColIndex > 1) {
-    for (let r = 1; r < allRoles.length; r++) {
-      const memberName = scheduleData[r][targetColIndex - 1];
-      if (memberName) prevAssignments.set(memberName, allRoles[r]);
-    }
-  }
+  const prevAssignments = new Map();
+  if (targetColIndex > 1) {
+    for (let r = 1; r < allRoles.length; r++) {
+      const memberName = scheduleData[r][targetColIndex - 1];
+      if (memberName) prevAssignments.set(memberName, allRoles[r]);
+    }
+  }
 
-  const hadEquivalentRole = (member, currentRole) => {
-    const lastRole = prevAssignments.get(member);
-    if (!lastRole) return false;
+  // ------------------ NEW LOOKBACK LOGIC ------------------
+  // Count how many times each member has been assigned a role in the
+  // previous LOOKBACK_WEEKS meetings.
+  const assignmentCounts = new Map();
+  if (targetColIndex > 1) {
+    const startCol = Math.max(1, targetColIndex - LOOKBACK_WEEKS);
+    for (let c = startCol; c < targetColIndex; c++) {
+      for (let r = 1; r < allRoles.length; r++) {
+        const member = scheduleData[r][c];
+        if (member) {
+          assignmentCounts.set(member, (assignmentCounts.get(member) || 0) + 1);
+        }
+      }
+    }
+  }
+
+  const hadEquivalentRole = (member, currentRole) => {
+    const lastRole = prevAssignments.get(member);
+    if (!lastRole) return false;
     const currentGroup = ROLE_EQUIVALENCIES.get(currentRole);
     const lastGroup = ROLE_EQUIVALENCIES.get(lastRole);
-    if (currentGroup && currentGroup === lastGroup) return true;
+    if (currentGroup && currentGroup === lastGroup) return true;
     return lastRole === currentRole;
-  };
+  };
   
+  // Helper to choose the least-assigned member from a pool, optionally obeying
+  // the equivalent-role rule.
+  const pickLeastAssigned = (pool, roleName, respectEquivalentRule = true) => {
+    let filtered = pool;
+    if (respectEquivalentRule) {
+      filtered = filtered.filter(m => !hadEquivalentRole(m, roleName));
+    }
+    if (filtered.length === 0) return null;
+
+    // Determine the minimum assignment count in the filtered pool.
+    let minCount = Infinity;
+    filtered.forEach(m => {
+      const cnt = assignmentCounts.get(m) || 0;
+      if (cnt < minCount) minCount = cnt;
+    });
+
+    // Collect all members who have this minimum count.
+    const candidates = filtered.filter(m => (assignmentCounts.get(m) || 0) === minCount);
+
+    // Return a random member among the best candidates to avoid bias.
+    return candidates[Math.floor(Math.random() * candidates.length)];
+  };
+
   const protectedToFill = [], otherToFill = [];
   const rolesData = scheduleSheet.getDataRange().getDisplayValues(); // Re-fetch data to see static assignments
   for (let r = 1; r < allRoles.length; r++) {
@@ -174,11 +219,14 @@ function fillNextEmptyMeetingColumn() {
     }
   }
   
+  // Build initial candidate pool and prioritise by least recent assignments.
   let candidatePool = availableMembers.filter(m => !alreadyAssignedThisTurn.has(m));
-  for (let i = candidatePool.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [candidatePool[i], candidatePool[j]] = [candidatePool[j], candidatePool[i]];
-  }
+  candidatePool.sort((a, b) => {
+      const diff = (assignmentCounts.get(a) || 0) - (assignmentCounts.get(b) || 0);
+      if (diff !== 0) return diff;
+      // Tie-break randomly when counts are equal.
+      return Math.random() - 0.5;
+  });
 
   // --- PHASE 1: FILL PROTECTED & UNIQUE GROUP ROLES ---
   protectedToFill.forEach(({ cell, roleName }) => {
@@ -199,28 +247,22 @@ function fillNextEmptyMeetingColumn() {
   otherToFill.forEach(({cell, roleName}) => {
       let bestCandidate = null;
 
-      // Tier 1: Prefer members who have NOT been assigned a role yet.
-      let preferredPool = availableMembers.filter(m => !alreadyAssignedThisTurn.has(m));
-      let idealPreferredPool = preferredPool.filter(m => !hadEquivalentRole(m, roleName));
-      
-      if (idealPreferredPool.length > 0) {
-          bestCandidate = idealPreferredPool[Math.floor(Math.random() * idealPreferredPool.length)];
-      } else {
-          // Tier 2 (Fallback): Use any available member.
-          let fallbackPool = availableMembers;
-          let idealFallbackPool = fallbackPool.filter(m => !hadEquivalentRole(m, roleName));
-          
-          if (idealFallbackPool.length > 0) {
-              bestCandidate = idealFallbackPool[Math.floor(Math.random() * idealFallbackPool.length)];
-          } else if (availableMembers.length > 0) {
-              // Super Fallback: If no one satisfies the "last week" rule, ignore it and pick anyone available.
-              bestCandidate = availableMembers[Math.floor(Math.random() * availableMembers.length)];
-          }
+      // Tier 1: Members not yet assigned in this meeting.
+      const preferredPool = availableMembers.filter(m => !alreadyAssignedThisTurn.has(m));
+      bestCandidate = pickLeastAssigned(preferredPool, roleName);
+
+      if (!bestCandidate) {
+          // Tier 2: Anyone available.
+          bestCandidate = pickLeastAssigned(availableMembers, roleName);
+      }
+
+      if (!bestCandidate && availableMembers.length > 0) {
+          // Final fallback: choose any available member at random.
+          bestCandidate = availableMembers[Math.floor(Math.random() * availableMembers.length)];
       }
 
       if (bestCandidate) {
           cell.setValue(bestCandidate);
-          // IMPORTANT: Add the assigned person to the set so they are not prioritized for the NEXT non-protected role.
           alreadyAssignedThisTurn.add(bestCandidate);
       } else {
           cell.setValue("NEEDS VOLUNTEER");
